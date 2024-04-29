@@ -25,15 +25,13 @@ import (
 	"syscall"
 
 	"github.com/opencontainers/selinux/go-selinux"
-
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
-	"github.com/vishvananda/netlink"
-
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
@@ -43,15 +41,15 @@ import (
 
 type NetConf struct {
 	types.NetConf
-	MultiQueue     bool    `json:"multiQueue"`
-	MTU            int     `json:"mtu"`
-	Mac            string  `json:"mac,omitempty"`
-	Owner          *uint32 `json:"owner,omitempty"`
-	Group          *uint32 `json:"group,omitempty"`
-	SelinuxContext string  `json:"selinuxContext,omitempty"`
-	Args           *struct {
-	} `json:"args,omitempty"`
-	RuntimeConfig struct {
+	MultiQueue     bool      `json:"multiQueue"`
+	MTU            int       `json:"mtu"`
+	Mac            string    `json:"mac,omitempty"`
+	Owner          *uint32   `json:"owner,omitempty"`
+	Group          *uint32   `json:"group,omitempty"`
+	SelinuxContext string    `json:"selinuxContext,omitempty"`
+	Bridge         string    `json:"bridge,omitempty"`
+	Args           *struct{} `json:"args,omitempty"`
+	RuntimeConfig  struct {
 		Mac string `json:"mac,omitempty"`
 	} `json:"runtimeConfig,omitempty"`
 }
@@ -176,14 +174,15 @@ func createLinkWithNetlink(tmpName string, mtu int, nsFd int, multiqueue bool, m
 }
 
 func createLink(tmpName string, conf *NetConf, netns ns.NetNS) error {
-	if conf.SelinuxContext != "" {
+	switch {
+	case conf.SelinuxContext != "":
 		if err := selinux.SetExecLabel(conf.SelinuxContext); err != nil {
 			return fmt.Errorf("failed set socket label: %v", err)
 		}
 		return createTapWithIptool(tmpName, conf.MTU, conf.MultiQueue, conf.Mac, conf.Owner, conf.Group)
-	} else if conf.Owner == nil || conf.Group == nil {
+	case conf.Owner == nil || conf.Group == nil:
 		return createTapWithIptool(tmpName, conf.MTU, conf.MultiQueue, conf.Mac, conf.Owner, conf.Group)
-	} else {
+	default:
 		return createLinkWithNetlink(tmpName, conf.MTU, int(netns.Fd()), conf.MultiQueue, conf.Mac, conf.Owner, conf.Group)
 	}
 }
@@ -216,6 +215,18 @@ func createTap(conf *NetConf, ifName string, netns ns.NetNS) (*current.Interface
 		link, err := netlink.LinkByName(ifName)
 		if err != nil {
 			return fmt.Errorf("failed to refetch tap %q: %v", ifName, err)
+		}
+
+		if conf.Bridge != "" {
+			bridge, err := netlink.LinkByName(conf.Bridge)
+			if err != nil {
+				return fmt.Errorf("failed to get bridge %s: %v", conf.Bridge, err)
+			}
+
+			tapDev := link
+			if err := netlink.LinkSetMaster(tapDev, bridge); err != nil {
+				return fmt.Errorf("failed to set tap %s as a port of bridge %s: %v", tap.Name, conf.Bridge, err)
+			}
 		}
 
 		err = netlink.LinkSetUp(link)
@@ -304,10 +315,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		err = netns.Do(func(_ ns.NetNS) error {
 			_, _ = sysctl.Sysctl(fmt.Sprintf("net/ipv4/conf/%s/arp_notify", args.IfName), "1")
 
-			if err := ipam.ConfigureIface(args.IfName, result); err != nil {
-				return err
-			}
-			return nil
+			return ipam.ConfigureIface(args.IfName, result)
 		})
 		if err != nil {
 			return err
@@ -363,7 +371,6 @@ func cmdDel(args *skel.CmdArgs) error {
 		}
 		return nil
 	})
-
 	if err != nil {
 		//  if NetNs is passed down by the Cloud Orchestration Engine, or if it called multiple times
 		// so don't return an error if the device is already removed.
@@ -435,7 +442,7 @@ func cmdCheck(args *skel.CmdArgs) error {
 	}
 
 	// Check prevResults for ips, routes and dns against values found in the container
-	if err := netns.Do(func(_ ns.NetNS) error {
+	return netns.Do(func(_ ns.NetNS) error {
 		err = ip.ValidateExpectedInterfaceIPs(args.IfName, result.IPs)
 		if err != nil {
 			return err
@@ -446,9 +453,5 @@ func cmdCheck(args *skel.CmdArgs) error {
 			return err
 		}
 		return nil
-	}); err != nil {
-		return err
-	}
-
-	return nil
+	})
 }
